@@ -15,10 +15,6 @@
 #define SYSTICK_RELOAD_VALUE SystemCoreClock/1000  // SysTick重装载值，系统时钟每毫秒触发一次中断
 #define DELAY_MS  250  // 定义宏用于SysTick延时时间计数
 
-// 定义宏用于读取特定引脚的电平状态并进行检查
-#define CHECK_SPO2_KEY()  (GPIO_ReadInputDataBit(GPIOC, GPIO_Pin_11) == 0)
-#define CHECK_ECG_KEY()   (GPIO_ReadInputDataBit(GPIOC, GPIO_Pin_12) == 0)
-#define CHECK_TEMP_KEY()  (GPIO_ReadInputDataBit(GPIOD, GPIO_Pin_2) == 0)
 /*********************************************************************************************************
 *                                              枚举结构体定义
 *********************************************************************************************************/
@@ -46,36 +42,66 @@ static __IO u32 s_iTimDelayCnt = DELAY_MS;
 /*********************************************************************************************************
 *                                              内部函数实现
 *********************************************************************************************************/
+//EXTI初始化函数
+void InitEXTI(void) {
+  RCC_APB2PeriphClockCmd(RCC_APB2Periph_AFIO, ENABLE);
+
+  EXTI_InitTypeDef EXTI_InitStructure;
+  NVIC_InitTypeDef NVIC_InitStructure;
+
+  GPIO_EXTILineConfig(GPIO_PortSourceGPIOC, GPIO_PinSource11);
+  GPIO_EXTILineConfig(GPIO_PortSourceGPIOC, GPIO_PinSource12);
+  GPIO_EXTILineConfig(GPIO_PortSourceGPIOD, GPIO_PinSource2);
+
+  EXTI_InitStructure.EXTI_Line = EXTI_Line11 | EXTI_Line12 | EXTI_Line2;
+  EXTI_InitStructure.EXTI_Mode = EXTI_Mode_Interrupt;
+  EXTI_InitStructure.EXTI_Trigger = EXTI_Trigger_Rising;
+  EXTI_InitStructure.EXTI_LineCmd = ENABLE;
+  EXTI_Init(&EXTI_InitStructure);
+
+  NVIC_InitStructure.NVIC_IRQChannel = EXTI15_10_IRQn; // PC11和PC12
+  NVIC_InitStructure.NVIC_IRQChannelPreemptionPriority = 0;
+  NVIC_InitStructure.NVIC_IRQChannelSubPriority = 0;
+  NVIC_InitStructure.NVIC_IRQChannelCmd = ENABLE;
+  NVIC_Init(&NVIC_InitStructure);
+
+  NVIC_InitStructure.NVIC_IRQChannel = EXTI2_IRQn; // PD2
+  NVIC_Init(&NVIC_InitStructure);
+}
+
+void EXTI15_10_IRQHandler(void) {
+  if(EXTI_GetFlagStatus(EXTI_Line11) != RESET) {
+    // 处理PC11中断
+    currentState = STATE_SPO2;
+    EXTI_ClearITPendingBit(EXTI_Line11);
+  }
+  if(EXTI_GetFlagStatus(EXTI_Line12) != RESET) {
+    // 处理PC12中断
+    currentState = STATE_ECG;
+    EXTI_ClearITPendingBit(EXTI_Line12);
+  }
+}
+
+void EXTI2_IRQHandler(void) {
+  if(EXTI_GetITStatus(EXTI_Line2) != RESET) {
+    // 处理PD2中断
+    currentState = STATE_TEMP;
+    EXTI_ClearITPendingBit(EXTI_Line2);
+  }
+}
+
 //按键初始化函数
 void InitKey(void) {
   RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOC | RCC_APB2Periph_GPIOD, ENABLE);
 
   GPIO_InitTypeDef GPIO_InitStructure;
 
-  // Key1
-  GPIO_InitStructure.GPIO_Pin = GPIO_Pin_11;
+  GPIO_InitStructure.GPIO_Pin = GPIO_Pin_11 | GPIO_Pin_12;  // Key1 Key2
   GPIO_InitStructure.GPIO_Mode = GPIO_Mode_IPU;
   GPIO_Init(GPIOC, &GPIO_InitStructure);
 
-  // Key2
-  GPIO_InitStructure.GPIO_Pin = GPIO_Pin_12;
-  GPIO_Init(GPIOC, &GPIO_InitStructure);
-
-  // Key3
-  GPIO_InitStructure.GPIO_Pin = GPIO_Pin_2;
+  GPIO_InitStructure.GPIO_Pin = GPIO_Pin_2;  // Key3
   GPIO_Init(GPIOD, &GPIO_InitStructure);
-}
-
-void ScanKey(u8* state) {
-  if(CHECK_SPO2_KEY()) {
-    *state = STATE_SPO2;
-  }
-  else if(CHECK_ECG_KEY()) {
-    *state = STATE_ECG;
-  }
-  else if(CHECK_TEMP_KEY()) {
-    *state = STATE_TEMP;
-  }
 }
 
 // SysTick 初始化函数
@@ -83,7 +109,7 @@ void InitSysTick(void) {
   SystemCoreClockUpdate();  //更新系统时钟
   if (SysTick_Config(SYSTICK_RELOAD_VALUE) != 0) {
     // 如果配置失败，进入死循环处理错误
-    while (1);
+    while (1){};
   }
 }
 
@@ -103,19 +129,15 @@ void InitLED(void) {
 
   GPIO_InitTypeDef GPIO_InitStructure;
 
-  GPIO_InitStructure.GPIO_Pin = GPIO_Pin_14;
+  GPIO_InitStructure.GPIO_Pin = GPIO_Pin_14 | GPIO_Pin_15; // PC14和PC15
   GPIO_InitStructure.GPIO_Mode = GPIO_Mode_Out_PP;
   GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
   GPIO_Init(GPIOC, &GPIO_InitStructure);
 
-  GPIO_InitStructure.GPIO_Pin = GPIO_Pin_15;
-  GPIO_Init(GPIOC, &GPIO_InitStructure);
-
-  GPIO_SetBits(GPIOC, GPIO_Pin_14);
-  GPIO_SetBits(GPIOC, GPIO_Pin_15);
+  GPIO_SetBits(GPIOC, GPIO_Pin_14 | GPIO_Pin_15);  // 默认高电平
 }
 
-void FlickerLED(u8 state) {
+void FlickerLED(const EnumSystemState state) {
   switch(state)
   {
     case STATE_SPO2:
@@ -187,24 +209,27 @@ void USART1_Init(void) {
 // 重定向 fputc 函数
 int fputc(int ch, FILE *f) {
   // 等待直到 USART1 的数据寄存器空闲
-  while (USART_GetFlagStatus(USART1, USART_FLAG_TXE) == RESET);
+  while (USART_GetFlagStatus(USART1, USART_FLAG_TXE) == RESET) {
+
+  };
   // 将字符发送到 USART1
   USART_SendData(USART1, (u8) ch);
   // 等待发送完成
-  while (USART_GetFlagStatus(USART1, USART_FLAG_TC) == RESET);
+  while (USART_GetFlagStatus(USART1, USART_FLAG_TC) == RESET) {
+
+  };
   return ch;
 }
 
 int main(void) {
   InitSysTick();
   USART1_Init();
+  InitEXTI();
 
   InitLED();
   InitKey();
 
   while(1) {
-    ScanKey(&currentState);
-
     switch(currentState) {
       case STATE_SPO2:
         FlickerLED(currentState);
