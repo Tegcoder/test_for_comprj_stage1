@@ -1,7 +1,14 @@
+/*********************************************************************************************************
+* 当前版本：4.0.0
+* 作    者：Tegco
+* 完成日期：2024年08月20日
+* 整机实现说明：三个按键 Key1、Key2 和 Key3，它们分别对应血氧、心电和体温的采集功能，目前血氧和心电只提供基础的波
+* 形显示，体温只提供S1采样并计算出电阻值，不提供C1C2校准。
+**********************************************************************************************************/
+
 #include "stm32f10x.h"
 #include <stdio.h>
 #include <stdbool.h>
-
 /*********************************************************************************************************
 *                                              宏定义
 *********************************************************************************************************/
@@ -14,26 +21,25 @@
 #define BAUD_RATE  115200
 #define SYSTICK_RELOAD_VALUE SystemCoreClock/1000  // SysTick重装载值，系统时钟每毫秒触发一次中断
 #define DELAY_250_MS  250  // 定义宏用于SysTick延时时间计数
-#define DAC_DEFAULT_VALUE 1500  // DAC输出的默认数字值（12位 4095），对应的模拟电压将基于参考电压(3V3)进行比例转换
+#define DAC_DEFAULT_VALUE 1500  // DAC输出的默认数字值（12位 4095），对应的模拟电压基于参考电压(3V3)进行转换
 
 // TIM2配置，用于一般任务的定时功能
-#define TIMER2_TASK_PSC    71   // TIM2预分频值，产生1MHz的时钟频率（72MHz/72）
-#define TIMER2_TASK_ARR    99   // TIM2重装载值，产生10kHz的定时中断（1MHz/100）
+#define TIMER2_TASK_PSC    71   // TIM2预分频值，将72MHz的系统时钟分频为1MHz时钟频率（72MHz/72）
+#define TIMER2_TASK_ARR    99   // TIM2重装载值，产生10kHz的定时中断信号（1MHz/100），对应的中断周期为100μs
 
 // TIM4配置，用于DAC1触发
-#define TIMER4_DAC1_PSC    71  // TIM4预分频值，产生100kHz的时钟频率（72MHz/720）
-#define TIMER4_DAC1_ARR    7999  // TIM4重装载值，产生125Hz的触发信号（100kHz/800）
+#define TIMER4_DAC1_PSC    71   // TIM4预分频值，将72MHz的系统时钟分频为100kHz时钟频率（72MHz/72）
+#define TIMER4_DAC1_ARR    7999 // TIM4重装载值，产生12.5Hz的触发信号（1MHz/8000），对应的触发周期为8ms
 
 // TIM3配置，用于ADC1触发，具体用于SPO2、ECG、TEMP等模块
-#define TIMER3_SPO2_PSC    71   // TIM3预分频值，产生1MHz的时钟频率（72MHz/72）
-#define TIMER3_SPO2_ARR    499  // TIM3重装载值，用于SPO2模块，产生2kHz的触发信号（1MHz/500）
+#define TIMER3_SPO2_PSC    71   // TIM3预分频值，将72MHz的系统时钟分频为1MHz时钟频率（72MHz/72）
+#define TIMER3_SPO2_ARR    49   // TIM3重装载值，产生20kHz的ADC触发信号（1MHz/50）,对应的触发周期为50μs
 
-#define TIMER3_ECG_PSC     71   // TIM3预分频值，产生1MHz的时钟频率（72MHz/72）
-#define TIMER3_ECG_ARR     99   // TIM3重装载值，用于ECG模块，产生10kHz的触发信号（1MHz/100）
+#define TIMER3_ECG_PSC     71   // TIM3预分频值，将72MHz的系统时钟分频为1MHz时钟频率（72MHz/72）
+#define TIMER3_ECG_ARR     99   // TIM3重装载值，产生10kHz的ADC触发信号（1MHz/100）,对应的触发周期为100μs
 
-#define TIMER3_TEMP_PSC    71   // TIM3预分频值，产生1MHz的时钟频率（72MHz/72）
-#define TIMER3_TEMP_ARR    7999 // TIM3重装载值，用于TEMP模块，产生125Hz的触发信号（1MHz/8000）
-
+#define TIMER3_TEMP_PSC    71   // TIM3预分频值，将72MHz的系统时钟分频为1MHz时钟频率（72MHz/72）
+#define TIMER3_TEMP_ARR    7999 // TIM3重装载值，产生125Hz的ADC触发信号（1MHz/8000）,对应的触发周期为8ms
 
 /*********************************************************************************************************
 *                                              枚举结构体定义
@@ -50,9 +56,9 @@ typedef enum {
 // 布尔类型结构体定义
 typedef struct {
   bool isDelayDone;
-  bool s_i500usFlag;    //将500us标志位的值设置为FALSE
-  bool s_i2msFlag;      //将2ms标志位的值设置为FALSE
-  bool s_i1secFlag;     //将1s标志位的值设置为FALSE
+  bool s_i500usFlag;
+  bool s_i2msFlag;
+  bool s_i1secFlag;
 } StructFlagTypeDef;
 
 /*********************************************************************************************************
@@ -63,7 +69,7 @@ EnumSystemState lastState = STATE_IDLE; // 使用辅助值表示未初始化状态
 StructFlagTypeDef flagType;
 
 static __IO u32 s_iSysTickDelayCnt = DELAY_250_MS;
-static u16 s_arrADC1Data;   //存放ADC转换结果数据
+u16 s_iADC1Data;   //存放ADC转换结果数据
 
 /*********************************************************************************************************
 *                                              内部函数实现
@@ -79,8 +85,8 @@ void InitTimer4ForDAC1(void) {
   TIM_TimeBaseInitStructure.TIM_Prescaler = TIMER4_DAC1_PSC;
   TIM_TimeBaseInitStructure.TIM_Period =    TIMER4_DAC1_ARR;
   TIM_TimeBaseInitStructure.TIM_CounterMode = TIM_CounterMode_Up;
-  TIM_TimeBaseInit(TIM4, &TIM_TimeBaseInitStructure);
 
+  TIM_TimeBaseInit(TIM4, &TIM_TimeBaseInitStructure);
   TIM_SelectOutputTrigger(TIM4, TIM_TRGOSource_Update);
 
   TIM_Cmd(TIM4, ENABLE);
@@ -88,40 +94,40 @@ void InitTimer4ForDAC1(void) {
 
 //TIM3定时器初始化函数
 void InitTimer3ForADC1(void) {
-  TIM_DeInit(TIM3);
 
-  RCC_APB1PeriphClockCmd(RCC_APB1Periph_TIM3, ENABLE);
+  RCC_APB1PeriphClockCmd(RCC_APB1Periph_TIM3, ENABLE);  //使能TIM3的时钟
+  TIM_DeInit(TIM3);
 
   TIM_TimeBaseInitTypeDef TIM_TimeBaseInitStructure;
 
 switch(currentState) {
   case STATE_SPO2:
-    TIM_TimeBaseInitStructure.TIM_Prescaler = TIMER3_SPO2_PSC; // 72MHz / (71 + 1) = 1MHz，定时器时钟频率为 1MHz
-    TIM_TimeBaseInitStructure.TIM_Period =    TIMER3_SPO2_ARR; // 1MHz / (499 + 1) = 2kHz（500μs），每 500μs 触发一次
+    TIM_TimeBaseInitStructure.TIM_Prescaler = TIMER3_SPO2_PSC;
+    TIM_TimeBaseInitStructure.TIM_Period =    TIMER3_SPO2_ARR;
     printf("Configured STATE_SPO2: Prescaler %d, Auto-reload %d\n", TIMER3_SPO2_PSC, TIMER3_SPO2_ARR);
     break;
 
   case STATE_ECG:
-    TIM_TimeBaseInitStructure.TIM_Prescaler = TIMER3_ECG_PSC; // 72MHz / (71 + 1) = 1MHz，定时器时钟频率为 1MHz
-    TIM_TimeBaseInitStructure.TIM_Period =    TIMER3_ECG_ARR; // 1MHz / (9999 + 1) = 100Hz（10ms），每 10ms 触发一次
+    TIM_TimeBaseInitStructure.TIM_Prescaler = TIMER3_ECG_PSC;
+    TIM_TimeBaseInitStructure.TIM_Period    = TIMER3_ECG_ARR;
     printf("Configured STATE_ECG: Prescaler %d, Auto-reload %d\n", TIMER3_ECG_PSC, TIMER3_ECG_ARR);
     break;
 
   case STATE_TEMP:
-    TIM_TimeBaseInitStructure.TIM_Prescaler = TIMER3_TEMP_PSC; // 72MHz / (71 + 1) = 1MHz，定时器时钟频率为 1MHz
-    TIM_TimeBaseInitStructure.TIM_Period =    TIMER3_TEMP_ARR; // 1MHz / (9999 + 1) = 100Hz（10ms），每 10ms 触发一次
+    TIM_TimeBaseInitStructure.TIM_Prescaler = TIMER3_TEMP_PSC;
+    TIM_TimeBaseInitStructure.TIM_Period =    TIMER3_TEMP_ARR;
     printf("Configured STATE_TEMP: Prescaler %d, Auto-reload %d\n", TIMER3_TEMP_PSC, TIMER3_TEMP_ARR);
     break;
 
   default:
     printf("Unspecified state!TIM3 configuration failure.\n");
     break;
-}
+  }
 
-  TIM_TimeBaseInitStructure.TIM_CounterMode = TIM_CounterMode_Up;
-  TIM_TimeBaseInit(TIM3, &TIM_TimeBaseInitStructure);
-
-  TIM_SelectOutputTrigger(TIM3, TIM_TRGOSource_Update);
+  TIM_TimeBaseInitStructure.TIM_CounterMode   = TIM_CounterMode_Up; //设置向上计数模式
+  TIM_TimeBaseInit(TIM3, &TIM_TimeBaseInitStructure);               //根据参数初始化定时器
+  TIM_SelectOutputTrigger(TIM3,TIM_TRGOSource_Update);          //选择更新事件为触发输入
+  TIM_Cmd(TIM3, ENABLE);  //使能定时器
 }
 
 //TIM2定时器初始化函数
@@ -187,32 +193,31 @@ void TIM2_IRQHandler(void) {
 
 //DAC配置
 void InitDAC(void) {
-  DAC_DeInit();
-
   RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA, ENABLE);
   RCC_APB1PeriphClockCmd(RCC_APB1Periph_DAC, ENABLE);
+  DAC_DeInit();
 
   GPIO_InitTypeDef GPIO_InitStructure;
   DAC_InitTypeDef DAC_InitStructure;
 
   GPIO_InitStructure.GPIO_Pin = GPIO_Pin_4;
   GPIO_InitStructure.GPIO_Mode = GPIO_Mode_AIN; // 防止寄生干扰
-  GPIO_Init(GPIOA, &GPIO_InitStructure);
 
   DAC_InitStructure.DAC_Trigger = DAC_Trigger_T4_TRGO;
-  DAC_Init(DAC_Channel_1, &DAC_InitStructure);
+  DAC_InitStructure.DAC_WaveGeneration = DAC_WaveGeneration_None; // 关闭波形生成
 
+  GPIO_Init(GPIOA, &GPIO_InitStructure);
+  DAC_Init(DAC_Channel_1, &DAC_InitStructure);
   DAC_SetChannel1Data(DAC_Align_12b_R, DAC_DEFAULT_VALUE); // DAC默认输出值
   DAC_Cmd(DAC_Channel_1, ENABLE);
 }
 
 //ADC配置
 void InitADC(void) {
-  ADC_DeInit(ADC1);
-
   // 使能ADC相关时钟
   RCC_ADCCLKConfig(RCC_PCLK2_Div6); // 设置ADC时钟分频，ADCCLK=PCLK2/6=12MHz
-  RCC_APB2PeriphClockCmd(RCC_APB2Periph_ADC1, ENABLE);  // 使能ADC1的时钟
+  RCC_APB2PeriphClockCmd(RCC_APB2Periph_ADC1  , ENABLE);
+  ADC_DeInit(ADC1);
 
   GPIO_InitTypeDef GPIO_InitStructure;
   ADC_InitTypeDef  ADC_InitStructure;
@@ -227,19 +232,19 @@ void InitADC(void) {
       GPIO_Init(GPIOA, &GPIO_InitStructure);
 
       ADC_InitStructure.ADC_ExternalTrigConv   = ADC_ExternalTrigConv_None; // 使用软件触发
-      ADC_RegularChannelConfig(ADC1, ADC_Channel_5, 1, ADC_SampleTime_239Cycles5); //设置采样时间为239.5个周期
+      ADC_RegularChannelConfig(ADC1, ADC_Channel_5, 1, ADC_SampleTime_239Cycles5); // 设置采样时间为239.5个周期
 
       printf("Configured STATE_SPO2: ADC_Channel_5, GPIOA_Pin_5, using software trigger\n");
       break;
 
     case STATE_ECG:
-      RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOC, ENABLE);
+      RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOC , ENABLE);
 
       GPIO_InitStructure.GPIO_Pin   = GPIO_Pin_4;
       GPIO_InitStructure.GPIO_Mode  = GPIO_Mode_AIN;
       GPIO_Init(GPIOC, &GPIO_InitStructure);
 
-      ADC_InitStructure.ADC_ExternalTrigConv   = ADC_ExternalTrigConv_T3_TRGO; // 使用TIM3触发
+      ADC_InitStructure.ADC_ExternalTrigConv   = ADC_ExternalTrigConv_T3_TRGO;  // 使用TIM3触发
       ADC_RegularChannelConfig(ADC1, ADC_Channel_14, 1, ADC_SampleTime_239Cycles5); //设置采样时间为239.5个周期
 
       printf("Configured STATE_ECG: ADC_Channel_14, GPIOC_Pin_4, using TIM3 trigger\n");
@@ -253,7 +258,7 @@ void InitADC(void) {
       GPIO_Init(GPIOA, &GPIO_InitStructure);
 
       ADC_InitStructure.ADC_ExternalTrigConv   = ADC_ExternalTrigConv_T3_TRGO; // 使用TIM3触发
-      ADC_RegularChannelConfig(ADC1, ADC_Channel_6, 1, ADC_SampleTime_239Cycles5); //设置采样时间为239.5个周期
+      ADC_RegularChannelConfig(ADC1, ADC_Channel_6, 1, ADC_SampleTime_239Cycles5); // 设置采样时间为239.5个周期
 
       printf("Configured STATE_TEMP: ADC_Channel_6, GPIOA_Pin_6, using TIM3 trigger\n");
       break;
@@ -262,30 +267,35 @@ void InitADC(void) {
       printf("Unspecified state!ADC configuration failure.\n");
       break;
   }
+
+  ADC_InitStructure.ADC_Mode               = ADC_Mode_Independent;  //设置为独立模式
+  ADC_InitStructure.ADC_ScanConvMode       = ENABLE;                //使能扫描模式
+  ADC_InitStructure.ADC_ContinuousConvMode = DISABLE;               //禁止连续转换模式
+  ADC_InitStructure.ADC_DataAlign          = ADC_DataAlign_Right;   //设置为右对齐
+  ADC_InitStructure.ADC_NbrOfChannel       = 1; //设置ADC的通道数目
+
   ADC_Init(ADC1, &ADC_InitStructure);
-
-  ADC_DMACmd(ADC1, ENABLE); // 使能DMA
-  ADC_Cmd(ADC1, ENABLE); // 使能ADC
-
-  ADC_ResetCalibration(ADC1); // 启动ADC复位校准
-  while (ADC_GetResetCalibrationStatus(ADC1)); // 等待复位校准完成
-  ADC_StartCalibration(ADC1); // 启动ADC校准
-  while (ADC_GetCalibrationStatus(ADC1)); // 等待校准完成
+  ADC_ExternalTrigConvCmd(ADC1, ENABLE);      //使用外部事件启动ADC转换
+  ADC_Cmd(ADC1, ENABLE);                      //使能ADC1
+  ADC_DMACmd(ADC1, ENABLE);                   //使能ADC1的DMA
+  ADC_ResetCalibration(ADC1);                 //启动ADC复位校准，即将RSTCAL赋值为1
+  while(ADC_GetResetCalibrationStatus(ADC1)); //读取并判断RSTCAL，RSTCAL为0跳出while语句
+  ADC_StartCalibration(ADC1);                 //启动ADC校准，即将CAL赋值为1
+  while(ADC_GetCalibrationStatus(ADC1));      //读取并判断CAL，CAL为0跳出while语句
 }
 
 //DMA1 初始化函数
 void InitDMA1Ch1ForADC1(void) {
+  //使能RCC相关时钟
+  RCC_AHBPeriphClockCmd(RCC_AHBPeriph_DMA1, ENABLE);  //使能DMA1的时钟
   DMA_DeInit(DMA1_Channel1);
 
   DMA_InitTypeDef DMA_InitStructure;  //DMA_InitStructure用于存放DMA的参数
 
-  //使能RCC相关时钟
-  RCC_AHBPeriphClockCmd(RCC_AHBPeriph_DMA1, ENABLE);  //使能DMA1的时钟
-
   //配置DMA1_Channel1
   DMA_DeInit(DMA1_Channel1);  //将DMA1_CH1寄存器设置为默认值
   DMA_InitStructure.DMA_PeripheralBaseAddr = (uint32_t)&(ADC1->DR);           //设置外设地址
-  DMA_InitStructure.DMA_MemoryBaseAddr     = (uint32_t)&s_arrADC1Data;        //设置存储器地址
+  DMA_InitStructure.DMA_MemoryBaseAddr     = (uint32_t)&s_iADC1Data;        //设置存储器地址
   DMA_InitStructure.DMA_DIR                = DMA_DIR_PeripheralSRC;           //设置为外设到存储器模式
   DMA_InitStructure.DMA_BufferSize         = 1;                               //设置要传输的数据项数目
   DMA_InitStructure.DMA_PeripheralInc      = DMA_PeripheralInc_Disable;       //设置外设为非递增模式
@@ -491,39 +501,130 @@ int fputc(int ch, FILE *f) {
   return ch;
 }
 
+///////////////////////////////////////// SPO2_CONFIG //////////////////////////////////////////////
+void SPO2_ConfigRedCS(void) {
+  RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA, ENABLE);
+
+  GPIO_InitTypeDef GPIO_InitStructure;
+
+  GPIO_InitStructure.GPIO_Pin = GPIO_Pin_2;
+  GPIO_InitStructure.GPIO_Mode = GPIO_Mode_Out_PP;
+  GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
+
+  GPIO_Init(GPIOA, &GPIO_InitStructure);
+  GPIO_SetBits(GPIOA, GPIO_Pin_2);
+}
+
+void SPO2_ConfigIRCS(void) {
+  RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA, ENABLE);
+
+  GPIO_InitTypeDef GPIO_InitStructure;
+
+  GPIO_InitStructure.GPIO_Pin = GPIO_Pin_3;
+  GPIO_InitStructure.GPIO_Mode = GPIO_Mode_Out_PP;
+  GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
+
+  GPIO_Init(GPIOA, &GPIO_InitStructure);
+  GPIO_ResetBits(GPIOA, GPIO_Pin_3);
+}
+
+///////////////////////////////////////// ECG_CONFIG //////////////////////////////////////////////
+void ECG_ConfigZERO(void) {
+  RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOC, ENABLE);
+
+  GPIO_InitTypeDef  GPIO_InitStructure;
+
+  GPIO_InitStructure.GPIO_Pin   = GPIO_Pin_13;
+  GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
+  GPIO_InitStructure.GPIO_Mode  = GPIO_Mode_Out_PP;
+
+  GPIO_Init(GPIOC, &GPIO_InitStructure);
+  GPIO_ResetBits(GPIOC, GPIO_Pin_13);            //ECG_ZERO默认设置为低电平
+}
+
+///////////////////////////////////////// TEMP_CONFIG //////////////////////////////////////////////
+void TEMP_ConfigPAPB(void) {
+  RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOB, ENABLE);
+  RCC_APB2PeriphClockCmd(RCC_APB2Periph_AFIO, ENABLE);
+
+  GPIO_InitTypeDef GPIO_InitStructure;
+
+  GPIO_InitStructure.GPIO_Pin = GPIO_Pin_3 | GPIO_Pin_4;
+  GPIO_InitStructure.GPIO_Mode = GPIO_Mode_Out_PP;
+  GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
+
+  // 禁用JTAG，保留SWD，释放PB3和PB4引脚
+  GPIO_PinRemapConfig(GPIO_Remap_SWJ_JTAGDisable, ENABLE);
+  GPIO_Init(GPIOB, &GPIO_InitStructure);
+  GPIO_ResetBits(GPIOB, GPIO_Pin_3 | GPIO_Pin_4);
+}
+
+void TEMP_ConfigSENS(void) {
+  // 使能GPIOC时钟
+  RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOC, ENABLE);
+
+  GPIO_InitTypeDef GPIO_InitStructure;
+
+  // 配置PC8和PC9为推挽输出
+  GPIO_InitStructure.GPIO_Pin = GPIO_Pin_8 | GPIO_Pin_9;
+  GPIO_InitStructure.GPIO_Mode = GPIO_Mode_Out_PP;
+  GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
+  GPIO_Init(GPIOC, &GPIO_InitStructure);
+
+  // 设置PC8为高电平，PC9为低电平
+  GPIO_SetBits(GPIOC, GPIO_Pin_8);
+  GPIO_ResetBits(GPIOC, GPIO_Pin_9);
+}
+
+void TEMP_ConfigSENSOFF(void) {
+  RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOB, ENABLE);
+
+  GPIO_InitTypeDef GPIO_InitStructure;
+
+  GPIO_InitStructure.GPIO_Pin = GPIO_Pin_5;
+  GPIO_InitStructure.GPIO_Mode = GPIO_Mode_IPU;
+
+  GPIO_Init(GPIOB, &GPIO_InitStructure);
+}
+
 // 状态切换配置函数
 void ConfigureForSpO2(void) {
+  SPO2_ConfigRedCS();
+  SPO2_ConfigIRCS();
 }
 
 void ConfigureForECG(void) {
+  ECG_ConfigZERO();
 }
 
 void ConfigureForTemperature(void) {
+  TEMP_ConfigPAPB();
+  TEMP_ConfigSENS();
 }
 
 // 外设初始化函数
 void PeripheralInit(void) {
-  USART1_Init();   // 初始化USART1，用于串口通信
+  USART1_Init();   // 初始化USART1，用于串口通信，用于调试信息的输出和数据的串行传输
 
-  InitSysTick();   // 初始化系统滴答定时器，用于生成系统心跳
+  InitSysTick();   // 初始化系统滴答定时器(SysTick)，用于生成系统心跳，并提供周期性中断
 
-  InitEXTI();      // 初始化外部中断，用于按键等外部事件的捕获
+  InitEXTI();      // 初始化外部中断(EXTI)，用于按键等外部事件的捕获，响应外部引脚的电平变化
 
-  InitTimer4ForDAC1();
+  InitTimer4ForDAC1();  // 初始化TIM4，用于DAC1的触发配置，生成定时信号控制DAC输出的更新
 
-  InitTimer3ForADC1();    // 初始化TIM3，用于ADC模块的触发配置
+  InitTimer3ForADC1();    // 初始化TIM3，用于ADC模块的触发配置，生成定时信号控制ADC的采样
 
-  InitTimer2ForTask();    // 初始化TIM2，用于其他定时功能
+  InitTimer2ForTask();    // 初始化TIM2，用于其他定时功能，提供系统中其他任务所需的定时中断
 
-  InitDMA1Ch1ForADC1();   // 初始化DMA，用于提高数据传输效率
+  InitDMA1Ch1ForADC1();   // 初始化DMA1通道1，用于提高ADC数据的传输效率，将ADC数据直接传输到内存
 
-  InitDAC();
+  InitDAC();  // 初始化DAC，用于将数字信号转换为模拟信号，控制DAC的输出
 
-  InitADC();       // 初始化ADC，用于模拟信号的采样和转换
+  InitADC();  // 初始化ADC，用于模拟信号的采样和转换，将模拟输入信号转换为数字信号
 
-  InitLED();       // 初始化LED，用于指示灯的控制
+  InitLED();  // 初始化LED，用于指示灯的控制，设置GPIO引脚用于控制LED的开关状态
 
-  InitKey();       // 初始化按键，用于用户输入的检测
+  InitKey();  // 初始化按键，用于用户输入的检测，设置GPIO引脚用于按键输入的读取
 }
 
 const char* GetStateName(EnumSystemState state) {
@@ -561,29 +662,65 @@ void HandleStateChange(void) {
    }
 }
 
+///////////////////////////////////////// SPO2_HANDLE //////////////////////////////////////////////
+void SPO2Wave(void) {
+  ADC_SoftwareStartConvCmd(ADC1, ENABLE);
+  printf("s_iADC1Data = %d\r\n", s_iADC1Data);
+}
+
+///////////////////////////////////////// ECG_HANDLE ///////////////////////////////////////////////
+void ECGWave(void) {
+  printf("s_iADC1Data = %d\r\n", s_iADC1Data);
+}
+
+///////////////////////////////////////// TEMP_HANDLE //////////////////////////////////////////////
+void CalcTVal(void) {
+  float VoltVal;
+  float R;
+  
+  VoltVal = (s_iADC1Data * 3.3) / 4095;
+  printf("VoltVal_With_Gain = %f\r\n", VoltVal);
+  VoltVal = (float)(s_iADC1Data * 33 * 100) / (4095* 10 * 125);
+  printf("VoltVal_Witout_Gain = %f\r\n", VoltVal);
+  R = (VoltVal * 147 / 10) / (5 - VoltVal);
+  printf("R = %f\r\n", R);
+}
+
 // 状态处理函数的实现
 void HandleSpO2(void) {
-  FlickerLED();
+  if(flagType.s_i2msFlag) {
+    SPO2Wave();
+    flagType.s_i2msFlag = false;
+  }
 }
 
 void HandleECG(void) {
-  FlickerLED();
+  if(flagType.s_i2msFlag) {
+    ECGWave();
+    flagType.s_i2msFlag = false;
+  }
 }
 
 void HandleTemperature(void) {
-  FlickerLED();
+  if(flagType.s_i1secFlag) {
+    CalcTVal();
+    flagType.s_i1secFlag = false;
+  }
 }
 
 // 执行当前状态的任务
 void ExecuteCurrentState(void) {
   switch (currentState) {
     case STATE_SPO2:
+      FlickerLED();
       HandleSpO2();
       break;
     case STATE_ECG:
+      FlickerLED();
       HandleECG();
       break;
     case STATE_TEMP:
+      FlickerLED();
       HandleTemperature();
       break;
     default:
@@ -595,7 +732,7 @@ void ExecuteCurrentState(void) {
 void Test(void) {
   u16 dacValue = DAC->DHR12R1;
   u16 adcValue = ADC1->DR;
-  u16 dmaValue = s_arrADC1Data;
+  u16 dmaValue = s_iADC1Data;
 
   // 打印DAC通道1输出值
   printf("DAC Value High Byte: %02X, Low Byte: %02X\r\n", (dacValue >> 8) & 0xFF, dacValue & 0xFF);
@@ -615,8 +752,8 @@ void Test(void) {
   printf("Current ADC Conversion Value (Hex): 0x%X\r\n", ADC1->DR);
 
   // 打印DMA传输的ADC数据
-  printf("DMA Transferred ADC Data (Decimal): %d\r\n", s_arrADC1Data);
-  printf("DMA Transferred ADC Data (Hex): 0x%X\r\n", s_arrADC1Data);
+  printf("DMA Transferred ADC Data (Decimal): %d\r\n", s_iADC1Data);
+  printf("DMA Transferred ADC Data (Hex): 0x%X\r\n", s_iADC1Data);
 }
 
 // 执行其他后台任务
@@ -634,7 +771,7 @@ void StateMachine(void) {
   while (1) {
     HandleStateChange();    // 处理状态切换
     ExecuteCurrentState();  // 执行当前状态的任务
-    PerformBackgroundTasks();  // 执行其他后台任务
+//    PerformBackgroundTasks();  // 执行其他后台任务
   }
 }
 
